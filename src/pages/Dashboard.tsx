@@ -3,17 +3,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { kpiData, messagesOverTime, messageTypeBreakdown, campaigns } from "@/data/dummy-data";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from "recharts";
-import { MessageSquare, TrendingUp, Zap, DollarSign, Radio, Plus, Upload, Send } from "lucide-react";
-
-const kpiCards = [
-  { title: "Total Messages Sent", value: kpiData.totalMessagesSent, icon: MessageSquare, color: "text-primary" },
-  { title: "Delivery Rate", value: kpiData.deliveryRate, icon: TrendingUp, color: "text-success" },
-  { title: "Active Campaigns", value: kpiData.activeCampaigns, icon: Zap, color: "text-warning" },
-  { title: "Revenue This Month", value: kpiData.revenueThisMonth, icon: DollarSign, color: "text-success" },
-  { title: "Active Sender IDs", value: kpiData.activeSenderIds, icon: Radio, color: "text-primary" },
-];
+import { MessageSquare, TrendingUp, Zap, DollarSign, Radio, Plus, Upload, Send, Loader2 } from "lucide-react";
+import { useDashboardData, useCampaigns } from "@/hooks/useData";
 
 const statusColor: Record<string, string> = {
   Completed: "bg-success text-success-foreground",
@@ -24,7 +16,28 @@ const statusColor: Record<string, string> = {
 };
 
 export default function Dashboard() {
+  const { kpis, messagesOverTime, messageTypeBreakdown, loading: dashboardLoading } = useDashboardData();
+  const { data: campaigns, loading: campaignsLoading } = useCampaigns();
+
+  const kpiCards = [
+    { title: "Total Messages Sent", value: kpis.totalMessagesSent, icon: MessageSquare, color: "text-primary" },
+    { title: "Delivery Rate", value: kpis.deliveryRate, icon: TrendingUp, color: "text-success" },
+    { title: "Active Campaigns", value: kpis.activeCampaigns, icon: Zap, color: "text-warning" },
+    { title: "Revenue This Month", value: kpis.revenueThisMonth, icon: DollarSign, color: "text-success" },
+    { title: "Active Sender IDs", value: kpis.activeSenderIds, icon: Radio, color: "text-primary" },
+  ];
+
   const recentCampaigns = campaigns.slice(0, 6);
+
+  if (dashboardLoading || campaignsLoading) {
+    return (
+      <AppLayout title="Dashboard">
+        <div className="flex items-center justify-center h-[60vh]">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        </div>
+      </AppLayout>
+    );
+  }
 
   return (
     <AppLayout title="Dashboard">
