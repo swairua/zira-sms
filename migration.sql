@@ -1,4 +1,4 @@
--- Enable pgcrypto for password hashing if needed
+-- Enable pgcrypto for password hashing
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- 1. ENUMS
@@ -13,16 +13,20 @@ CREATE TYPE sender_id_type AS ENUM ('Promotional', 'Transactional');
 CREATE TYPE sender_id_status AS ENUM ('Approved', 'Pending', 'Rejected');
 CREATE TYPE shortcode_status AS ENUM ('Active', 'Inactive', 'Pending');
 CREATE TYPE premium_service_status AS ENUM ('Active', 'Suspended', 'Pending');
+CREATE TYPE transaction_type AS ENUM ('Top-up', 'Usage', 'Refund', 'Adjustment');
+CREATE TYPE message_status AS ENUM ('Pending', 'Sent', 'Delivered', 'Failed', 'Rejected', 'Buffered');
+CREATE TYPE route_strategy AS ENUM ('Least Cost', 'High Priority', 'Round Robin');
 
 -- 2. TABLES
 
--- Tenants (Organizations)
+-- Tenants (Organizations/Customers)
 CREATE TABLE tenants (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     company TEXT NOT NULL,
     contact_person TEXT,
     plan tenant_plan DEFAULT 'Starter',
-    sms_balance BIGINT DEFAULT 0,
+    sms_balance DECIMAL(12, 4) DEFAULT 0.0000, -- Changed to decimal for precise credit management
+    currency CHAR(3) DEFAULT 'KES',
     status tenant_status DEFAULT 'Trial',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -31,7 +35,7 @@ CREATE TABLE tenants (
 -- Admin Users (linked to Supabase Auth)
 CREATE TABLE admin_users (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    auth_user_id UUID UNIQUE, -- Link to auth.users(id)
+    auth_user_id UUID UNIQUE,
     tenant_id INT REFERENCES tenants(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     email TEXT UNIQUE NOT NULL,
@@ -40,6 +44,66 @@ CREATE TABLE admin_users (
     last_login TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- SMS Providers (The 3rd party gateways we resell from)
+CREATE TABLE sms_providers (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    api_endpoint TEXT,
+    api_key_id TEXT,
+    api_secret TEXT,
+    callback_url TEXT,
+    priority INT DEFAULT 1, -- 1 is highest
+    is_active BOOLEAN DEFAULT TRUE,
+    buying_price_per_sms DECIMAL(10, 4) DEFAULT 0.0000,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Rate Plans (To manage different pricing for different customers)
+CREATE TABLE rate_plans (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_default BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Rates (Pricing per country/prefix for each rate plan)
+CREATE TABLE rates (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rate_plan_id INT REFERENCES rate_plans(id) ON DELETE CASCADE,
+    country_code TEXT NOT NULL, -- e.g., '254'
+    prefix TEXT, -- e.g., '71', '72' (optional for more granular routing)
+    selling_price DECIMAL(10, 4) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(rate_plan_id, country_code, prefix)
+);
+
+-- Billing Transactions (Credit Ledger)
+CREATE TABLE billing_transactions (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT REFERENCES tenants(id) ON DELETE CASCADE,
+    type transaction_type NOT NULL,
+    amount DECIMAL(12, 4) NOT NULL,
+    balance_before DECIMAL(12, 4) NOT NULL,
+    balance_after DECIMAL(12, 4) NOT NULL,
+    reference TEXT, -- e.g., M-Pesa code or Message ID
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- API Keys (For developer integration)
+CREATE TABLE api_keys (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT REFERENCES tenants(id) ON DELETE CASCADE,
+    key_hint TEXT NOT NULL, -- e.g., 'sk_live_...1234'
+    encrypted_key TEXT NOT NULL,
+    name TEXT DEFAULT 'Default Key',
+    is_active BOOLEAN DEFAULT TRUE,
+    last_used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Sender IDs
@@ -84,7 +148,7 @@ CREATE TABLE contacts (
 CREATE TABLE campaigns (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id INT REFERENCES tenants(id) ON DELETE CASCADE,
-    sender_id_text TEXT, -- The name of the sender ID used
+    sender_id_text TEXT,
     name TEXT NOT NULL,
     type campaign_type DEFAULT 'Promotional',
     recipients_count INT DEFAULT 0,
@@ -95,6 +159,26 @@ CREATE TABLE campaigns (
     created_date DATE DEFAULT CURRENT_DATE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Individual Messages (The high-volume log)
+CREATE TABLE messages (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT REFERENCES tenants(id) ON DELETE CASCADE,
+    campaign_id INT REFERENCES campaigns(id) ON DELETE SET NULL,
+    provider_id INT REFERENCES sms_providers(id) ON DELETE SET NULL,
+    sender_id_text TEXT,
+    recipient_phone TEXT NOT NULL,
+    message_body TEXT NOT NULL,
+    segments INT DEFAULT 1,
+    cost DECIMAL(10, 4) DEFAULT 0.0000,
+    provider_ref TEXT, -- Reference ID from the 3rd party gateway
+    status message_status DEFAULT 'Pending',
+    error_code TEXT,
+    error_description TEXT,
+    sent_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Shortcodes
@@ -126,6 +210,16 @@ CREATE TABLE premium_services (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Webhook Endpoints (For DLRs to customers)
+CREATE TABLE webhook_endpoints (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT REFERENCES tenants(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    secret TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Audit Logs
 CREATE TABLE audit_logs (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -137,10 +231,13 @@ CREATE TABLE audit_logs (
 );
 
 -- 3. INDEXES
+CREATE INDEX idx_messages_recipient ON messages(recipient_phone);
+CREATE INDEX idx_messages_status ON messages(status);
+CREATE INDEX idx_messages_tenant ON messages(tenant_id);
+CREATE INDEX idx_messages_provider_ref ON messages(provider_ref);
+CREATE INDEX idx_billing_tenant ON billing_transactions(tenant_id);
 CREATE INDEX idx_contacts_phone ON contacts(phone);
-CREATE INDEX idx_admin_users_email ON admin_users(email);
-CREATE INDEX idx_campaigns_status ON campaigns(status);
-CREATE INDEX idx_tenants_status ON tenants(status);
+CREATE INDEX idx_rates_lookup ON rates(country_code, prefix);
 
 -- 4. TRIGGER FOR UPDATED_AT
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -153,6 +250,7 @@ $$ language 'plpgsql';
 
 CREATE TRIGGER update_tenants_updated_at BEFORE UPDATE ON tenants FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 CREATE TRIGGER update_admin_users_updated_at BEFORE UPDATE ON admin_users FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
+CREATE TRIGGER update_sms_providers_updated_at BEFORE UPDATE ON sms_providers FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 CREATE TRIGGER update_sender_ids_updated_at BEFORE UPDATE ON sender_ids FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 CREATE TRIGGER update_contact_groups_updated_at BEFORE UPDATE ON contact_groups FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 CREATE TRIGGER update_contacts_updated_at BEFORE UPDATE ON contacts FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
@@ -161,91 +259,23 @@ CREATE TRIGGER update_shortcodes_updated_at BEFORE UPDATE ON shortcodes FOR EACH
 CREATE TRIGGER update_premium_services_updated_at BEFORE UPDATE ON premium_services FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 
 -- 5. SUPER ADMIN INSERTION
--- Note: This part assumes it's run in a Supabase environment where auth schema exists.
--- Password hashing: Ziratech@2026
-
 DO $$
 DECLARE
   new_user_id UUID;
 BEGIN
-  -- Check if user already exists
   IF NOT EXISTS (SELECT 1 FROM auth.users WHERE email = 'support@ziratech.com') THEN
-    -- Insert into auth.users (Supabase managed table)
-    -- We use crypt() for the password hash
     INSERT INTO auth.users (
-      instance_id,
-      id,
-      aud,
-      role,
-      email,
-      encrypted_password,
-      email_confirmed_at,
-      recovery_sent_at,
-      last_sign_in_at,
-      raw_app_meta_data,
-      raw_user_meta_data,
-      created_at,
-      updated_at,
-      confirmation_token,
-      email_change,
-      email_change_token_new,
-      recovery_token
+      instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, recovery_sent_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token
     )
     VALUES (
-      '00000000-0000-0000-0000-000000000000',
-      gen_random_uuid(),
-      'authenticated',
-      'authenticated',
-      'support@ziratech.com',
-      crypt('Ziratech@2026', gen_salt('bf')),
-      NOW(),
-      NOW(),
-      NOW(),
-      '{"provider": "email", "providers": ["email"]}',
-      '{"name": "Zira Tech Support"}',
-      NOW(),
-      NOW(),
-      '',
-      '',
-      '',
-      ''
+      '00000000-0000-0000-0000-000000000000', gen_random_uuid(), 'authenticated', 'authenticated', 'support@ziratech.com', crypt('Ziratech@2026', gen_salt('bf')), NOW(), NOW(), NOW(), '{"provider": "email", "providers": ["email"]}', '{"name": "Zira Tech Support"}', NOW(), NOW(), '', '', '', ''
     )
     RETURNING id INTO new_user_id;
 
-    -- Insert into auth.identities
-    INSERT INTO auth.identities (
-      id,
-      user_id,
-      identity_data,
-      provider,
-      last_sign_in_at,
-      created_at,
-      updated_at
-    )
-    VALUES (
-      gen_random_uuid(),
-      new_user_id,
-      format('{"sub":"%s","email":"%s"}', new_user_id::text, 'support@ziratech.com')::jsonb,
-      'email',
-      NOW(),
-      NOW(),
-      NOW()
-    );
+    INSERT INTO auth.identities (id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+    VALUES (gen_random_uuid(), new_user_id, format('{"sub":"%s","email":"%s"}', new_user_id::text, 'support@ziratech.com')::jsonb, 'email', NOW(), NOW(), NOW());
 
-    -- Insert into public.admin_users
-    INSERT INTO public.admin_users (
-      auth_user_id,
-      name,
-      email,
-      role,
-      status
-    )
-    VALUES (
-      new_user_id,
-      'Zira Tech Support',
-      'support@ziratech.com',
-      'Super Admin',
-      'Active'
-    );
+    INSERT INTO public.admin_users (auth_user_id, name, email, role, status)
+    VALUES (new_user_id, 'Zira Tech Support', 'support@ziratech.com', 'Super Admin', 'Active');
   END IF;
 END $$;
